@@ -5,6 +5,8 @@ import jakarta.ws.rs.container.*;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.ext.Provider;
 import org.eclipse.microprofile.config.inject.ConfigProperty;
+import org.jboss.resteasy.reactive.common.core.AbstractResteasyReactiveContext;
+import org.jboss.resteasy.reactive.server.spi.ResteasyReactiveContainerRequestContext;
 
 import java.io.IOException;
 import java.net.URI;
@@ -71,7 +73,7 @@ public class ImmutableLogFilter implements ContainerRequestFilter, ContainerResp
             : status >= 300 ? "info"
             : "success";
 
-        emit(requestId, eventName, type, method, path, status, latencyMs, req, null);
+        emit(requestId, eventName, type, method, path, status, latencyMs, req, getThrowable(req));
     }
 
     private void emit(String requestId, String eventName, String type,
@@ -170,6 +172,21 @@ public class ImmutableLogFilter implements ContainerRequestFilter, ContainerResp
 
     private String truncate(String value, int max) {
         return value.length() > max ? value.substring(0, max) : value;
+    }
+
+    /**
+     * Exception thrown by the resource and already turned into a response (WebApplicationException
+     * or an ExceptionMapper of the app), or null. A ContainerResponseFilter does not receive it, so
+     * it is read from the RESTEasy Reactive request context, which keeps it after mapping. Read
+     * only: the response, its status and the app's mappers are untouched. An exception no mapper
+     * handles never reaches this filter (Quarkus answers 500 outside JAX-RS), so it has no event.
+     */
+    private Throwable getThrowable(ContainerRequestContext req) {
+        if (!(req instanceof ResteasyReactiveContainerRequestContext)) return null;
+        Object ctx = ((ResteasyReactiveContainerRequestContext) req).getServerRequestContext();
+        return ctx instanceof AbstractResteasyReactiveContext
+            ? ((AbstractResteasyReactiveContext<?, ?>) ctx).getThrowable()
+            : null;
     }
 
     private String getClientIp(ContainerRequestContext req) {

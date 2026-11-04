@@ -24,7 +24,7 @@ Usa `ContainerRequestFilter` + `ContainerResponseFilter`. O `@Provider` é desco
 
 **Requisitos:** Quarkus 3 — o filtro importa `jakarta.*` (`jakarta.ws.rs`, `jakarta.annotation`), não `javax.*`, e o Quarkus 3 exige Java 17+.
 
-**RESTEasy Reactive obrigatório.** Para ler a exceção da requisição, o filtro importa duas classes do RESTEasy Reactive (`org.jboss.resteasy.reactive.common.core.AbstractResteasyReactiveContext` e `org.jboss.resteasy.reactive.server.spi.ResteasyReactiveContainerRequestContext`), que vêm com `quarkus-resteasy-reactive` / `quarkus-rest`. Com o RESTEasy clássico (`quarkus-resteasy`) essas classes não existem e o arquivo não compila. A primeira não é API pública do RESTEasy Reactive: se uma versão futura do Quarkus mudar essa classe, o erro aparece na compilação.
+**RESTEasy Reactive obrigatório.** Para ler a exceção da requisição, o filtro importa duas classes do RESTEasy Reactive (`org.jboss.resteasy.reactive.common.core.AbstractResteasyReactiveContext` e `org.jboss.resteasy.reactive.server.spi.ResteasyReactiveContainerRequestContext`), que vêm com `quarkus-resteasy-reactive` / `quarkus-rest`. Com o RESTEasy clássico (`quarkus-resteasy`) essas classes não existem e o arquivo não compila. A primeira não é API pública do RESTEasy Reactive: se uma versão futura do Quarkus mudar essa classe, o erro aparece na compilação. Para ler o IP da conexão, o filtro também injeta `io.vertx.ext.web.RoutingContext` (`@Inject`): o RESTEasy Reactive roda sobre o Vert.x e não há API servlet, então o endereço remoto vem do Vert.x. Sem requisição Vert.x ativa, esse IP simplesmente não é usado.
 
 ---
 
@@ -138,7 +138,7 @@ Exemplo de uma requisição que chegou com `X-Forwarded-For: 1.2.3.4`:
 
 > `env` é mantido por compatibilidade; `environment` é o nome canônico do contrato
 > (`CONTRACT.md` §4.1 do `immutablelog_siem`).
-> **Sem `X-Forwarded-For`, não há `client_ip` em `meta`**, e no payload ele vai como `"unknown"`: o JAX-RS não expõe o endereço remoto neste filtro.
+> **Sem `X-Forwarded-For` com IP válido, `client_ip` é o IP da conexão** (lido do `RoutingContext` do Vert.x). Se nem esse for um IP válido, `client_ip` é omitido do `meta` **e** do payload. Cópias antigas mandavam `"unknown"` no payload; a versão atual nunca manda.
 > `path` no payload é o valor de `getUriInfo().getPath()` sem tratamento. Com Quarkus 3.15.1 e RESTEasy Reactive ele veio **com** barra inicial (`/payments`); outra implementação JAX-RS pode devolver sem a barra.
 > **Quando o recurso lança uma exceção que vira resposta** — `WebApplicationException` (inclusive `NotFoundException` e afins) ou uma exceção tratada por `ExceptionMapper` da aplicação —, o evento leva `meta.error_type` (nome da classe), `meta.error_message` (até 500 caracteres; omitido se vazio) e, no payload, `"error": {"type": ..., "message": ..., "retryable": ...}` (`retryable` é `false` só para `IllegalArgumentException`). O status do evento é o da resposta enviada (ex.: `422` do seu mapper). Exceção **sem** mapper não gera evento nenhum — ver [Comportamento](#comportamento).
 >
@@ -166,11 +166,11 @@ Exemplo de uma requisição que chegou com `X-Forwarded-For: 1.2.3.4`:
 
 ## Limitações conhecidas
 
-- **`client_ip` vem só de header, sem validação.** O filtro usa o primeiro item de `X-Forwarded-For`, sem validar o valor; quem chama a aplicação diretamente (sem um proxy que sobrescreva o header) pode forjar o IP registrado. Sem o header, o valor é `"unknown"` e `meta.client_ip` não é enviado.
+- **`client_ip` vem primeiro de um header que o chamador controla.** O filtro usa o primeiro item de `X-Forwarded-For` se ele for um IP válido; senão, o IP da conexão (`routingContext.request().remoteAddress().host()`), também validado; senão, nenhum. `X-Real-IP` não é lido. Quem chama a aplicação diretamente (sem um proxy que sobrescreva o header) pode forjar o IP registrado, desde que mande um IP válido. Antes de validar, o valor passa por `trim` e perde a porta (`10.0.0.1:8080`, `[2001:db8::1]:8080`) e os colchetes. A validação não faz consulta DNS: IPv4 é conferido por expressão regular, e só chega ao `InetAddress.getByName` um valor com `:` feito apenas de dígitos hexadecimais, `:` e `.`, que ele interpreta como literal IPv6. Sem IP válido, `client_ip` não vai nem no `meta` nem no payload.
 - **`Idempotency-Key` é um UUID aleatório gerado pelo filtro a cada requisição**, o mesmo valor de `meta.request_id`. Não vem de nenhum header da requisição de entrada.
 - **Entrega sem garantia.** Um único `sendAsync()` por evento: sem timeout configurado, sem retry, sem fila. A resposta do ImmutableLog é descartada e qualquer erro (rede, status 4xx/5xx, falha ao montar o evento) é ignorado em silêncio — o evento simplesmente se perde.
 - **Sem suporte a trilha (`immutable_trail`):** o filtro não envia nenhum campo de trilha.
-- **Chaves reservadas enviadas em `meta`:** `service`, `environment` (e `env`), `http_method`, `http_status`, `http_route` (caminho concreto) e `log_level` sempre; `client_ip` só com `X-Forwarded-For`; `error_type` e `error_message` só quando o recurso lançou uma exceção que virou resposta (ver [Payload enviado](#payload-enviado)). Todos são strings.
+- **Chaves reservadas enviadas em `meta`:** `service`, `environment` (e `env`), `http_method`, `http_status`, `http_route` (caminho concreto) e `log_level` sempre; `client_ip` só quando há IP válido (de `X-Forwarded-For` ou da conexão); `error_type` e `error_message` só quando o recurso lançou uma exceção que virou resposta (ver [Payload enviado](#payload-enviado)). Todos são strings.
 - **Erro 500 por exceção não tratada não é auditado.** Uma exceção sem `ExceptionMapper` sai do JAX-RS e o Quarkus responde 500 pelo próprio tratador de erro; nenhum `ContainerResponseFilter` roda e nenhum evento é enviado. Isso não se resolve dentro deste filtro sem mudar a resposta da aplicação. Se precisar desses eventos, mapeie a exceção num `ExceptionMapper` seu (aí o evento sai, com `error_type`).
 - **`status`** no payload é o código HTTP numérico da resposta; `meta.http_status` é o mesmo valor como string.
 - **Sem body:** o filtro não envia o body da requisição nem hash dele. Também não envia a query string (o caminho vem de `getUriInfo().getPath()`).

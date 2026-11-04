@@ -1,5 +1,7 @@
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.annotation.Priority;
+import jakarta.inject.Inject;
 import jakarta.ws.rs.Priorities;
 import jakarta.ws.rs.container.*;
 import jakarta.ws.rs.core.Context;
@@ -9,12 +11,14 @@ import org.jboss.resteasy.reactive.common.core.AbstractResteasyReactiveContext;
 import org.jboss.resteasy.reactive.server.spi.ResteasyReactiveContainerRequestContext;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.net.URI;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.util.*;
+import java.util.regex.Pattern;
 
 @Provider
 @Priority(Priorities.USER - 100)
@@ -31,6 +35,11 @@ public class ImmutableLogFilter implements ContainerRequestFilter, ContainerResp
 
     @ConfigProperty(name = "immutablelog.url", defaultValue = "https://api.immutablelog.com")
     String apiUrl;
+
+    // RESTEasy Reactive runs on Vert.x (there is no servlet API): the connection
+    // address comes from the Vert.x RoutingContext of the current request.
+    @Inject
+    RoutingContext routingContext;
 
     private static final String START_KEY = "imtbl.startedAt";
     private static final String REQ_ID_KEY = "imtbl.requestId";
@@ -80,12 +89,15 @@ public class ImmutableLogFilter implements ContainerRequestFilter, ContainerResp
                       String method, String path, int status,
                       long latencyMs, ContainerRequestContext req, Throwable ex) {
         try {
+            // Bare IP (no port) or null; when null, client_ip is left out of payload and meta.
+            String clientIp = getClientIp(req);
+
             Map<String, Object> payloadMap = new LinkedHashMap<>();
             payloadMap.put("method", method);
             payloadMap.put("path", path);
             payloadMap.put("status", status);
             payloadMap.put("latency_ms", latencyMs);
-            payloadMap.put("client_ip", getClientIp(req));
+            if (clientIp != null) payloadMap.put("client_ip", clientIp);
             payloadMap.put("user_agent", req.getHeaderString("User-Agent"));
 
             if (ex != null) {
@@ -115,11 +127,8 @@ public class ImmutableLogFilter implements ContainerRequestFilter, ContainerResp
             meta.put("log_level", logLevelFrom(type));
 
             // client_ip has to travel in meta (not only in the payload) so the platform can
-            // promote it to source.ip; "unknown" is not an IP, so it is not worth sending.
-            String clientIp = getClientIp(req);
-            if (clientIp != null && !clientIp.isBlank() && !clientIp.equals("unknown")) {
-                meta.put("client_ip", clientIp);
-            }
+            // promote it to source.ip. Only a bare IP is promoted, so nothing else is sent.
+            if (clientIp != null) meta.put("client_ip", clientIp);
 
             if (ex != null) {
                 meta.put("error_type", ex.getClass().getName());
@@ -189,10 +198,54 @@ public class ImmutableLogFilter implements ContainerRequestFilter, ContainerResp
             : null;
     }
 
+    /**
+     * Client IP for client_ip: the first X-Forwarded-For entry when it is a valid IP, otherwise
+     * the IP of the connection (Vert.x remoteAddress().host()). Returns null when neither is a
+     * valid IP. X-Forwarded-For is only trustworthy behind a proxy/ALB that overwrites it:
+     * without one, any caller can forge it.
+     */
     private String getClientIp(ContainerRequestContext req) {
         String xff = req.getHeaderString("X-Forwarded-For");
-        if (xff != null && !xff.isBlank()) return xff.split(",")[0].trim();
-        // UriInfo doesn't expose remote addr in JAX-RS; inject @Context HttpServletRequest if needed
-        return "unknown";
+        if (xff != null) {
+            String ip = bareIp(xff.split(",")[0]);
+            if (ip != null) return ip;
+        }
+        try {
+            var remote = routingContext.request().remoteAddress();
+            return remote == null ? null : bareIp(remote.host());
+        } catch (RuntimeException e) {
+            return null; // no active Vert.x request (e.g. outside the HTTP layer)
+        }
+    }
+
+    private static final Pattern IPV4 = Pattern.compile(
+        "(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)(\\.(25[0-5]|2[0-4]\\d|1\\d\\d|[1-9]?\\d)){3}");
+    private static final Pattern IPV6_CHARS = Pattern.compile("[0-9A-Fa-f:.]+");
+
+    /**
+     * Trims v, strips a port ("10.0.0.1:8080", "[2001:db8::1]:8080") or brackets, and returns
+     * the bare IP, or null if it is not one. Never resolves a host name: IPv4 is matched by
+     * pattern, and InetAddress only sees strings with ':' made of hex digits, which it parses
+     * as an IPv6 literal (or rejects) without DNS.
+     */
+    static String bareIp(String v) {
+        if (v == null) return null;
+        v = v.trim();
+        if (v.startsWith("[")) {
+            int end = v.indexOf(']');
+            String rest = end < 0 ? null : v.substring(end + 1);
+            if (rest == null || !(rest.isEmpty() || rest.matches(":\\d+"))) return null;
+            v = v.substring(1, end);
+        } else if (v.indexOf(':') > 0 && v.indexOf(':') == v.lastIndexOf(':')) {
+            v = v.substring(0, v.indexOf(':'));
+        }
+        if (IPV4.matcher(v).matches()) return v;
+        if (v.indexOf(':') < 0 || !IPV6_CHARS.matcher(v).matches()) return null;
+        try {
+            InetAddress.getByName(v);
+            return v;
+        } catch (Exception e) {
+            return null;
+        }
     }
 }
